@@ -2,6 +2,7 @@
 extern crate log;
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 use std::time::Duration;
 use std::{io, thread};
 use std::{net::SocketAddr, sync::Arc};
@@ -13,7 +14,7 @@ use tokio::time::error::Elapsed;
 use crate::remotelink::RemoteLink;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener};
 use tokio::{task, time};
 
 // All requirements for `rustls`
@@ -37,6 +38,12 @@ mod locallink;
 mod network;
 mod remotelink;
 mod state;
+
+// All requirements for `websocket`
+#[cfg(feature = "websocket")]
+use ws_stream_tungstenite::WsStream;
+#[cfg(feature = "websocket")]
+use async_tungstenite::tokio::{accept_async};
 
 use crate::consolelink::ConsoleLink;
 pub use crate::locallink::{LinkError, LinkRx, LinkTx};
@@ -130,9 +137,10 @@ pub enum ServerCert {
     },
 }
 
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ServerSettings {
-    pub listen: SocketAddr,
+    pub listen: Url,
     pub cert: Option<ServerCert>,
     pub next_connection_delay_ms: u64,
     pub connections: ConnectionSettings,
@@ -359,10 +367,9 @@ impl Server {
         Err(Error::RustlsNotEnabled)
     }
 
-    async fn start(&self) -> Result<(), Error> {
-        let listener = TcpListener::bind(&self.config.listen).await?;
+    async fn start_tcp(&self) -> Result<(), Error> {
+        let listener = TcpListener::bind(&self.config.listen.socket_addrs(|| Some(1080))?[0]).await?;
         let delay = Duration::from_millis(self.config.next_connection_delay_ms);
-        let mut count = 0;
 
         let config = Arc::new(self.config.connections.clone());
 
@@ -383,15 +390,17 @@ impl Server {
             None => None,
         };
 
+        let mut count: usize = 0;
+
         let max_incoming_size = config.max_payload_size;
 
         info!(
             "Waiting for connections on {}. Server = {}",
-            self.config.listen, self.id
+            self.config.listen.as_str(), self.id
         );
         loop {
             // Await new network connection.
-            let (stream, addr) = match listener.accept().await {
+            let (tcp_stream, addr) = match listener.accept().await {
                 Ok((s, r)) => (s, r),
                 Err(_e) => {
                     error!("Unable to accept socket.");
@@ -409,7 +418,7 @@ impl Server {
                     match a {
                         #[cfg(feature = "use-rustls")]
                         ServerTLSAcceptor::RustlsAcceptor { acceptor } => {
-                            let stream = match acceptor.accept(stream).await {
+                            let stream = match acceptor.accept(tcp_stream).await {
                                 Ok(v) => v,
                                 Err(e) => {
                                     error!("Failed to accept TLS connection using Rustls. Error = {:?}", e);
@@ -417,11 +426,21 @@ impl Server {
                                 }
                             };
 
-                            Network::new(stream, max_incoming_size)
+                            match self.config.listen.scheme() {
+                                #[cfg(feature = "websocket")]
+                                "ws" | "wss" => {
+                                    // ... next step error handling here
+                                    let stream = accept_async(stream).await.map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+                                    Network::new(WsStream::new(stream), max_incoming_size)
+                                },
+                                "tcp" => Network::new(stream, max_incoming_size),
+                                // ... next step error handling here
+                                _ => Network::new(stream, max_incoming_size)
+                            }
                         }
                         #[cfg(feature = "use-native-tls")]
                         ServerTLSAcceptor::NativeTLSAcceptor { acceptor } => {
-                            let stream = match acceptor.accept(stream).await {
+                            let stream = match acceptor.accept(tcp_stream).await {
                                 Ok(v) => v,
                                 Err(e) => {
                                     error!("Failed to accept TLS connection using Native TLS. Error = {:?}", e);
@@ -429,19 +448,41 @@ impl Server {
                                 }
                             };
 
-                            Network::new(stream, max_incoming_size)
+                            match self.config.listen.scheme() {
+                                #[cfg(feature = "websocket")]
+                                "ws" | "wss" => {
+                                    let stream = accept_async(stream).await.map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+                                    Network::new(WsStream::new(stream), max_incoming_size)
+                                },
+                                _ => Network::new(stream, max_incoming_size)
+                            }
                         }
                     }
                 }
                 None => {
                     info!("{}. Accepting TCP connection from: {}", count, addr);
-                    Network::new(stream, max_incoming_size)
+                    match self.config.listen.scheme() {
+                        #[cfg(feature = "websocket")]
+                        "ws" | "wss" => {
+                            let stream = accept_async(tcp_stream).await.map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+                            Network::new(WsStream::new(stream), max_incoming_size)
+                        },
+                        _ => Network::new(tcp_stream, max_incoming_size)
+                    }
                 }
             };
+
             #[cfg(not(any(feature = "use-rustls", feature = "use-native-tls")))]
-            let network = {
+            let stream = {
                 info!("{}. Accepting TCP connection from: {}", count, addr);
-                Network::new(stream, max_incoming_size)
+                match self.config.listen.scheme() {
+                    #[cfg(feature = "websocket")]
+                    "ws" | "wss" => {
+                        let stream = accept_async(tcp_stream).await.map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+                        Network::new(WsStream::new(stream), max_incoming_size)
+                    },
+                    _ => Network::new(tcp_stream, max_incoming_size)
+                }
             };
 
             count += 1;
@@ -456,8 +497,16 @@ impl Server {
                     error!("Dropping link task!! Result = {:?}", e);
                 }
             });
-
             time::sleep(delay).await;
+        }
+    }
+
+    async fn start(&self) -> Result<(), Error> {
+        println!("{:?}", self.config.listen.scheme());
+
+        match self.config.listen.scheme() {
+            "tcp" => self.start_tcp().await,
+            _ => self.start_tcp().await
         }
     }
 }

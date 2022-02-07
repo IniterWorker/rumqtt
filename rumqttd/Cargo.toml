@@ -19,10 +19,11 @@ name = "rumqttd"
 path = "src/bin.rs"
 
 [features]
-default = ["use-rustls"]
+default = ["use-rustls", "websocket"]
 prof = ["pprof"]
 use-rustls = ["tokio-rustls"]
 use-native-tls = ["tokio-native-tls"]
+websocket = ["async-tungstenite", "ws_stream_tungstenite"]
 
 [dependencies]
 rumqttlog = { path = "../rumqttlog", version = "0.9"}
@@ -38,6 +39,9 @@ bytes = "1.0"
 warp = "0.3"
 futures-util = "0.3.8"
 pprof = { version = "0.4", features = ["flamegraph", "protobuf"], optional = true }
+url = { version = "2.2.2", features = ["serde"] }
+async-tungstenite = { version = "0.16.1", default-features = false, features = ["tokio-rustls-webpki-roots"], optional = true }
+ws_stream_tungstenite = { version = "0.7.0", default-features = false, features = ["tokio_io"], optional = true }
 
 # Optional
 tokio-rustls = { version = "0.22", optional = true }
